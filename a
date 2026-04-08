@@ -1,0 +1,128 @@
+from __future__ import annotations
+
+from module.docschema.document import Documento
+from module.docschema.documents.base import DocumentoBase
+
+from .dto import RelatorioPropostaDTO
+
+
+# ========================
+# Documento principal
+# ========================
+class RelatorioProposta(DocumentoBase[RelatorioPropostaDTO]):
+    def construir(self) -> Documento:
+        from module.docschema import (
+            Secao, Titulo, Paragrafo, Lista, ItemLista, Tabela,
+            Nota, Citacao, LinhaHorizontal, Espaco,
+            Texto, Negrito, Italico,
+            Badge, DataHora, Local, Ancora, RefCruzada,
+            MarcadorRodape, Variavel,
+            TabelaConteudo, Assinatura, Formulario, CampoFormulario,
+            Se, Para,
+        )
+        from module.docschema.elements.block import CelulaTabela
+        from module.docschema.utils import formatters
+
+        dto = self.dto
+        doc = Documento(titulo="Análise proposta Tomador")
+
+        # Seção: Sumula
+        if dto.sumula:
+            sumula = dto.sumula
+
+            sumula_sec = Secao(
+                titulo=Titulo("Dados da Proposta", nivel=2),
+                id="sumula-sec"
+            )
+            sumula_sec.add(Paragrafo([Texto(f"Valor contratado: {formatters.real(sumula.valor_contratado)}")]))
+            sumula_sec.add(Paragrafo([Texto(f"Taxa juros: {formatters.porcentagem(sumula.taxa_juros_mes)}")]))
+            sumula_sec.add(Paragrafo([Texto(f"Seguro: {sumula.seguro_proposta}")]))
+            sumula_sec.add(Paragrafo([Texto(f"Carência: {formatters.inteiro(sumula.carencia_dias)} dias")]))
+            sumula_sec.add(Paragrafo([Texto(f"Prazo: {formatters.inteiro(sumula.prazo_meses)} meses")]))
+            sumula_sec.add(Paragrafo([Texto(f"Carteira: {sumula.carteira}")]))
+            sumula_sec.add(Paragrafo([Texto(f"Estágio: {sumula.estagio}")]))
+            sumula_sec.add(Paragrafo([
+                Texto(f"Perda Esperada: {formatters.porcentagem(sumula.perc_perda_esperada)}"),
+                Texto(" - "),
+                Texto(formatters.real(sumula.valor_perda_esperada)),
+            ]))
+            sumula_sec.add(Paragrafo([Texto(f"Capacidade pagamento: {sumula.capacidade_pagamento}")]))
+
+            doc.add(sumula_sec)
+
+            if sumula.garantias_pessoais:
+                gp_sec = Secao(
+                    titulo=Titulo("Garantias Pessoais", nivel=3),
+                    id="garantias-pessoais-sec"
+                )
+                
+                for gp in sumula.garantias_pessoais:
+                    gp_sec_item = Secao(
+                        titulo=Titulo(gp.nome, nivel=4),
+                        id=f"garantia-pessoal-{gp.cpf_cnpj}-sec"
+                    )
+                    lista = Lista()
+                    lista.add(ItemLista([Texto(f"CPF/CNPJ: {gp.cpf_cnpj}")]))
+                    lista.add(ItemLista([Texto(f"Qtd. Op. Direta: {formatters.inteiro(gp.qtd_op_direta)} - Valor: {formatters.real(gp.valor_op_direta)}")]))
+                    lista.add(ItemLista([Texto(f"Qtd. Op. Indireta: {formatters.inteiro(gp.qtd_op_indireta)} - Valor: {formatters.real(gp.valor_op_indireta)}")]))
+                    lista.add(ItemLista([Texto(f"Valor total bens: {formatters.real(gp.valor_total_bens)}")]))
+                    gp_sec_item.add(lista)
+                    gp_sec.add(gp_sec_item)
+
+                doc.add(gp_sec)
+
+            if sumula.garantias_reais:
+                gr_sec = Secao(
+                    titulo=Titulo("Garantias Reais", nivel=3),
+                    id="garantias-reais-sec"
+                )
+
+                for gr in sumula.garantias_reais:
+                    gr_sec_item = Secao(
+                        titulo=Titulo(gr.grupo_garantia, nivel=4),
+                        id=f"garantia-real-{gr.grupo_garantia}-sec"
+                    )
+                    # Cabeçalho da tabela
+                    cabecalho = [
+                        CelulaTabela([Texto("Nome")], negrito=True),
+                        CelulaTabela([Texto("CPF/CNPJ")], negrito=True),
+                        CelulaTabela([Texto("Responsabilidade")], negrito=True)
+                    ]
+                    linhas = []
+                    if gr.pessoas:
+                        for pessoa in gr.pessoas:
+                            linhas.append([
+                                CelulaTabela([Texto(pessoa.nome)]),
+                                CelulaTabela([Texto(formatters.mascara_cpf_cnpj(pessoa.cpf_cnpj))]),
+                                CelulaTabela([Texto(pessoa.responsabilidade)]),
+                            ])
+                    else:
+                        linhas.append([
+                            CelulaTabela([Texto("-")]),
+                            CelulaTabela([Texto("-")]),
+                            CelulaTabela([Texto("Sem pessoas vinculadas")]),
+                        ])
+                    tabela = Tabela(
+                        cabecalho=cabecalho,
+                        linhas=linhas,
+                        legenda=f"Valor garantia: {formatters.real(gr.valor_garantia)} | Última avaliação: {formatters.data(gr.ultima_avaliacao)}"
+                    )
+                    gr_sec_item.add(tabela)
+                    gr_sec.add(gr_sec_item)
+                    doc.add(gr_sec)
+                
+
+        # Seção: Cooperado (dados tomador)
+        if dto.dados_pessoa:
+            dp_sec = Secao(
+                titulo=Titulo("Dados do Tomador", nivel=2),
+                id="dados-tomador-sec"
+            )
+            dp_sec.add(Paragrafo([Texto(f"Nome: {dto.dados_pessoa.nome_pessoa}")]))
+            dp_sec.add(Paragrafo([Texto(f"CPF/CNPJ: {formatters.mascara_cpf_cnpj(dto.dados_pessoa.cpf_cnpj)}")]))
+
+
+            doc.add(dp_sec)
+
+
+        return doc
