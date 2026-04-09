@@ -1,0 +1,546 @@
+from collections import defaultdict
+
+from django.db.models import Count, Sum
+from django.core.exceptions import ObjectDoesNotExist
+
+from sumula.models import Sumula, GarantiaPessoal, GarantiaReal, GarantiaRealPessoa
+from sumula.models_proxies import SumulaProxy
+from pessoa.models import Cheque, GarantiaOperacao, Pessoa, Socio
+from pessoa.models_proxies.pessoa import PessoaProxy
+from pessoa.models_proxies.operacao import ContaCorrenteProxy
+from proposta.models import Analise
+from proposta.services.propostas.copiar.utils import calcular_diferenca_data, format_estagio, \
+    formatar_porcentagem, formatar_valor, format_max_modalidade
+
+
+class CopiarColarPropostaService:
+    def __init__(self, analise_model: Analise):
+        self.analise_model = analise_model
+        self.string_para_copiar = ""
+        self.setup()
+
+    # Setup functions
+    def setup(self):
+        self.initail_setup()
+        self.sumula_setup()
+        self.calculated_values_setup()
+    
+    def initail_setup(self):
+        self.pessoa: PessoaProxy = self.analise_model.pessoa.as_proxy
+        self.dados_gerais = getattr(self.pessoa, 'dados_gerais', None)
+        if self.analise_model.tomador == True:
+            self.grupo_economico = self.pessoa.get_pessoas_grupo_economico()
+        else:
+            self.grupo_economico = None
+        self.consolidado = getattr(self.pessoa,'consolidado', None)
+        self.saldo_medio = self.pessoa.saldo_medio.first()
+        self.conta_capital = getattr(self.pessoa, 'conta_capital', None) 
+        self.aplicacao = self.pessoa.aplicacao.first()
+        self.renda = self.pessoa.renda.first()
+        self.conjuge = self.pessoa.pessoa_conjuge.first()
+        self.limite = self.pessoa.limite_desconto.first()
+        self.cheques_agregados = Cheque.objects.filter(pessoa__pk=self.pessoa.pk).values(
+            'motivo_devolucao').annotate(total_valor=Sum('valor'), total_cheques=Count('id'))
+        self.cheques_agregados_dict = {item['motivo_devolucao']: {
+            'total_valor': item['total_valor'], 'total_cheques': item['total_cheques']} for item in self.cheques_agregados}
+        self.socios = Socio.objects.filter(pessoa=self.pessoa).all()
+        self.bens_patrimoniais = self.pessoa.bens_patrimoniais.all().order_by('-valor_bem')
+        self.operacao_pessoa = self.pessoa.operacao.all().order_by('-data_operacao_abertura_conta_corrente')
+
+        self.operacoes_vigentes = defaultdict(list)
+        for op in self.operacao_pessoa:
+            if op.situacao_contrato_conta_corrente == "ENTRADA NORMAL" or op.modalidade == "CARTAO":
+                self.operacoes_vigentes[op.modalidade].append(op)
+        for modalidade, operacoes in self.operacoes_vigentes.items():
+            for operacao in operacoes:
+                operacao.garantias = list(
+                    GarantiaOperacao.objects.filter(contrato=operacao))
+
+        self.bacen = self.pessoa.bacen.all().order_by('-valor_saldo_devedor')
+        self.conta_corrente_pessoa = ContaCorrenteProxy.objects.filter(pessoa=self.pessoa).order_by('-valor_operacao_limite')
+        for garantia_cc in self.conta_corrente_pessoa:
+            garantia_cc.garantias_conta_corrente = GarantiaOperacao.objects.filter(contrato=garantia_cc)
+        self.renda_bacen = self.pessoa.renda_bacen.all().order_by('-data_movimento')
+        self.anotacoes_baixadas_por_mes, self.anotacoes_vigentes_por_mes = self.pessoa.anotacoes_agregadas_por_mes()
+        self.crl = self.pessoa.crls.first()
+        self.serasa = self.pessoa.serasa.first()
+
+    def sumula_setup(self):
+        self.sumula = None
+        self.garantias_pessoais = []
+        self.garantias_real = []
+        if self.analise_model.tomador == True:
+            try:
+                self.sumula: SumulaProxy = SumulaProxy.objects.get(proposta=self.analise_model.proposta)
+
+                try:
+                    self.garantias_pessoais = GarantiaPessoal.objects.filter(
+                        sumula=self.sumula)
+                except ObjectDoesNotExist:
+                    self.garantias_pessoais = []
+
+                try:
+                    self.garantias_real = GarantiaReal.objects.filter(
+                        sumula=self.sumula)
+                except ObjectDoesNotExist:
+                    self.garantias_real = []
+
+            except ObjectDoesNotExist:
+                self.sumula = None
+            cpf_cnpj_consulta = self.pessoa.cpf_cnpj
+
+            if self.garantias_real:
+                self.total_real = self.sumula.get_valor_garantia_real()
+                self.total_quantidade_real = self.sumula.get_quantidade_garantia_real()
+            try:
+                self.nome_pessoa = GarantiaPessoal.objects.filter(
+                    pessoa__cpf_cnpj=cpf_cnpj_consulta)
+            except Pessoa.DoesNotExist:
+                pass
+
+    def calculated_values_setup(self):
+        self.saldo_devedor_grupo = 0
+        self.saldo_devedor_bacen_grupo = 0
+        self.valor_total_capital_grupo = 0
+        self.valor_total_bens_grupo = 0
+        if self.grupo_economico:
+            self.saldo_devedor_grupo = self.pessoa.saldo_devedor_operacoes_grupo()
+            self.saldo_devedor_bacen_grupo = self.pessoa.saldo_devedor_bacen_grupo()
+            self.valor_total_capital_grupo = self.pessoa.valor_total_capital_grupo()
+            self.valor_total_bens_grupo = self.pessoa.valor_total_bens_grupo()
+
+        self.valor_total_bens_garantia = self.sumula.get_bens_garantia_pessoal() if self.sumula else 0
+
+        self.tempo_constituicao = calcular_diferenca_data(
+            self.dados_gerais.data_nascimento_constituicao) if self.dados_gerais else (0, 0, 0)
+        self.tempo_matricula = calcular_diferenca_data(
+            self.conta_capital.data_matricula) if self.conta_capital else (0, 0, 0)
+
+        self.total_saldo_devedor_td = 0
+        self.valor_total_das_operacoes = 0
+        self.valor_parcelas = 0
+        self.total_saldo_devedor_td_prejuizo = 0
+        self.valor_total_das_operacoes_prejuizo = 0
+        self.valor_parcelas_prejuizo = 0
+        self.quant_parcelas = 0
+        self.quant_parcelas_prejuizo = 0
+
+        self.garantia_td = []
+        self.garantia_td_prej = []
+
+    # Copiar Functions
+    def copiar_sumula(self) -> str:
+        if not self.sumula:
+            return ""
+
+        string_para_copiar = ""
+        string_para_copiar += "Dados da Proposta" + "\n"
+        string_para_copiar += f"Valor Contratado: {formatar_valor(self.sumula.valor_contratado)}\n"
+        string_para_copiar += f"Taxa Juros: {formatar_porcentagem(self.sumula.porc_taxa_ao_mes)}\n"
+        string_para_copiar += f"Seguro: {self.sumula.seguro_proposta}\n"
+        string_para_copiar += f"Carência: {self.sumula.carencia} dias\n"
+        string_para_copiar += f"Prazo: {self.sumula.get_prazo()} meses\n"
+        string_para_copiar += f"Carteira: {self.sumula.perfil_carteira}\n"
+        string_para_copiar += f"Estágio: {format_estagio(self.sumula.estagio_perda_esperada)}\n"
+        string_para_copiar += f"Perda Esperada: {formatar_porcentagem(self.sumula.porc_perda_esperado)} - {formatar_valor(self.sumula.valor_perda_esperada)}\n"
+        string_para_copiar += f"Capacidade de Pagamento: {self.sumula.capacidade_pagamento}\n\n"
+
+        if self.garantias_pessoais:
+            string_para_copiar += "Garantias Pessoais" + "\n"
+            for g_pessoa in self.garantias_pessoais:
+                string_para_copiar += "Nome/Razão Social: " + \
+                    str(g_pessoa.nome if g_pessoa else "--") + " | "
+                string_para_copiar += "CPF/CNPJ: " + \
+                    str(g_pessoa.pessoa.cpf_cnpj if g_pessoa else "--") + " | "
+                string_para_copiar += "Quant. Op. Direta: " + \
+                    str(g_pessoa.qtd_op_direta if g_pessoa else "--") + " | "
+                string_para_copiar += "Valor Op. Direta: " + \
+                    str(formatar_valor(g_pessoa.valor_op_direta)
+                        if g_pessoa else "--") + " | "
+                string_para_copiar += "Quant. Op. Indireta: " + \
+                    str(g_pessoa.qtd_op_indireta if g_pessoa else "--") + " | "
+                string_para_copiar += "Valor Op. Indireta: " + \
+                    str(formatar_valor(g_pessoa.valor_op_indireta)
+                        if g_pessoa else "--") + " | "
+                string_para_copiar += "Valor total bens: " + \
+                    str(formatar_valor(g_pessoa.pessoa.as_proxy.get_total_bem())
+                        if g_pessoa else "--") + "\n"
+            string_para_copiar += "\nValor total em bens: " + \
+                str(formatar_valor(self.valor_total_bens_garantia)) + "\n"
+            string_para_copiar += "\n"
+
+        if self.garantias_real:
+            string_para_copiar += "Garantias Reais - Total: " + \
+                str(formatar_valor(self.total_real)) + " - Quant.: " + \
+                str(self.total_quantidade_real) + "\n"
+            for g_pessoa in self.garantias_real:
+                string_para_copiar += "Grupo Garantia: " + \
+                    str(g_pessoa.grupo_garantia) + " | "
+                string_para_copiar += "Valor Garantia: " + \
+                    str(formatar_valor(g_pessoa.valor_garantia)) + " | "
+                g_real_ultima_atualizacao = g_pessoa.ultima_atualizacao.strftime(
+                    '%d/%m/%Y') if g_pessoa.ultima_atualizacao else "--"
+                string_para_copiar += "Última Avaliação: " + \
+                    str(g_real_ultima_atualizacao) + "\n"
+                garantias_pessoas = GarantiaRealPessoa.objects.filter(
+                    garantia=g_pessoa)
+                for g_pessoa_rel in garantias_pessoas:
+                    string_para_copiar += "Nome/Razão Social: " + \
+                        str(g_pessoa_rel.nome if g_pessoa else "--") + " | "
+                    string_para_copiar += "CPF/CNPJ: " + \
+                        str(g_pessoa_rel.pessoa.cpf_cnpj) + " | "
+                    string_para_copiar += "Responsabilidade: " + \
+                        str(g_pessoa_rel.responsabilidade) + "\n"
+                string_para_copiar += "\n"
+        return string_para_copiar
+
+    def copiar_dados_pessoa(self) -> str:
+        string_para_copiar = "" 
+        if self.analise_model.tomador == True:
+            string_para_copiar += 'Dados do Tomador \n'
+
+        # Early return if no data is present
+        if not any([
+            self.dados_gerais, self.renda, self.bens_patrimoniais, self.conta_corrente_pessoa, 
+            self.operacao_pessoa, self.bacen, self.serasa, self.anotacoes_baixadas_por_mes, 
+            self.anotacoes_vigentes_por_mes]):
+            string_para_copiar += "Pessoa não possui dados cadastrados " + "\n" + "\n"
+            return string_para_copiar
+
+        if self.dados_gerais:
+            if len(self.pessoa.cpf_cnpj) == 11:  # CPF
+                string_para_copiar += "Nome Cooperado: " + \
+                    (self.dados_gerais.nome_razao_social if self.dados_gerais else "--") + "\n"
+                string_para_copiar += "Profissão: " + \
+                    (self.dados_gerais.profissao if self.dados_gerais else "--") + " | "
+                string_para_copiar += "Idade: " + \
+                    (self.tempo_constituicao if self.dados_gerais and self.dados_gerais.data_nascimento_constituicao else "--") + " | "
+                string_para_copiar += "Risco: " + \
+                    str(self.crl.nivel_risco if self.crl else "--") + "\n" + "\n"
+            elif len(self.pessoa.cpf_cnpj) == 14:  # CNPJ
+                string_para_copiar += "Razão Social: " + \
+                    (self.dados_gerais.nome_razao_social if self.dados_gerais else "--") + " | "
+                string_para_copiar += "Nome Fantasia: " + \
+                    (self.dados_gerais.nome_fantasia if self.dados_gerais else "--") + " | "
+                string_para_copiar += "CNAE Descrição: " + \
+                    (self.dados_gerais.cnae if self.dados_gerais else "--") + " | "
+                string_para_copiar += "Tempo de Constituição: " + \
+                    (self.tempo_constituicao if self.dados_gerais and self.dados_gerais.data_nascimento_constituicao else "--") + " | "
+                string_para_copiar += "Risco: " + \
+                    str(self.crl.nivel_risco if self.crl else "--") + \
+                    "\n" + "\n"
+        else:
+            string_para_copiar += "Nome/Razão Social: " + \
+                str(self.nome_pessoa.first(
+                ).nome if self.nome_pessoa else "--") + "\n"
+
+        if len(self.pessoa.cpf_cnpj) == 11 and self.dados_gerais:
+            if self.dados_gerais.estado_civil == 'CASADO(A)' or self.dados_gerais.estado_civil == 'UNIÃO ESTAVEL':
+                string_para_copiar += "Estado Civil: " + \
+                    str(self.dados_gerais.estado_civil if self.dados_gerais else "--") + " | "
+                string_para_copiar += "CPF do Cônjuge: " + \
+                    str(self.conjuge.relacionado.cpf_cnpj if self.conjuge else "--") + " | "
+                string_para_copiar += "Nome do Cônjuge: " + \
+                    str(self.conjuge.nome if self.conjuge else "--") + " | "
+                string_para_copiar += "Regime de Bens: " + \
+                    str(self.dados_gerais.regime_bens if self.dados_gerais else "--") + "\n" + "\n"
+            else:
+                string_para_copiar += "Estado Civil: " + \
+                    str(self.dados_gerais.estado_civil if self.dados_gerais else "--") + "\n" + "\n"
+
+        if self.socios.exists():
+            string_para_copiar += f"Sociedade\n"
+            for socio in self.socios:
+                string_para_copiar += "Nome: " + str(socio.nome) + " | "
+                string_para_copiar += "CPF: " + \
+                    str(socio.relacionado.cpf_cnpj) + " | "
+                string_para_copiar += "Tipo Relacionamento: " + \
+                    str(socio.tipo_relacionamento) + " | "
+                string_para_copiar += "Capital da Empresa: " + \
+                    str(formatar_porcentagem(socio.capital_empresa)) + "\n"
+        else:
+            string_para_copiar += ""
+
+        if self.renda:
+            string_para_copiar += "\nTipo da renda: " + \
+                str(self.renda.tipo_renda if self.renda else "--") + " | "
+            string_para_copiar += "Renda Bruta Mensal Total: " + \
+                str(formatar_valor(self.renda.renda_bruta_mensal)
+                    if self.renda else "--") + " | "
+            string_para_copiar += "Data da Atualização da renda: " + \
+                str(self.renda.data_atualizacao.strftime('%d/%m/%Y')
+                    if self.renda else "--") + "\n" + "\n"
+        else:
+            string_para_copiar += "\nPessoa não possui renda " + "\n" + "\n"
+ 
+        if self.bens_patrimoniais:
+            string_para_copiar += f"Total agregado Bens\n"
+            get_total_value = self.pessoa.get_total_value()
+            string_para_copiar += "Valor Total: " + \
+                str(formatar_valor(get_total_value['total_value'])) + " | "
+            string_para_copiar += "Quantidade Total: " + \
+                str(get_total_value['total_quantity']) + "\n" + "\n"
+        else:
+            string_para_copiar += "Não possui bens" + "\n" + "\n"
+
+        if self.conta_capital:
+            string_para_copiar += "Conta Capital" + "\n"
+            string_para_copiar += "Valor Conta Capital: " + \
+                (str(formatar_valor(self.conta_capital.valor_integralizado))
+                    if self.conta_capital else "--") + " | "
+            string_para_copiar += "Tempo desde matrícula: " + \
+                (self.tempo_matricula if self.conta_capital.data_matricula else "--") + "\n" + "\n"
+        else:
+            string_para_copiar += "Não possui conta capital" + "\n" + "\n"
+
+        quadrante, soc, _ = self.pessoa.get_quadrante()
+
+        if self.consolidado:
+            string_para_copiar += "IAP: " + \
+                (str(self.consolidado.iap) if self.consolidado else "--") + " | "
+            if quadrante:
+                string_para_copiar += "Quadrante: Q" + \
+                    (str(quadrante) if quadrante else "--") + " | "
+            string_para_copiar += "Rentabilidade: " + \
+                (str(formatar_valor(self.consolidado.margem_contribuicao))
+                    if self.consolidado else "--") + "\n"
+
+        if soc:
+            string_para_copiar += "SOC: " + \
+                str(formatar_porcentagem(soc)) + "\n"
+
+        if self.aplicacao:
+            string_para_copiar += "Aplicações: " + \
+                (str(formatar_valor(self.aplicacao.valor)) 
+                    if self.aplicacao else "R$ 0,00") + "\n"
+
+        if self.saldo_medio:
+            string_para_copiar += "Saldo Médio: " + \
+                (str(formatar_valor(self.saldo_medio.valor))
+                    if self.saldo_medio else "--") + "\n"
+        return string_para_copiar
+
+    def copiar_conta_corrente(self) -> str:
+        string_para_copiar = ""
+        if self.conta_corrente_pessoa.exists():
+            string_para_copiar += f"\nConta Corrente\n"
+            for conta_corrente in self.conta_corrente_pessoa:
+                string_para_copiar += "Limite Contratado: " + \
+                    str(formatar_valor(conta_corrente.valor_operacao_limite)) + " | "
+                string_para_copiar += "Saldo Devedor Limite: " + \
+                    str(formatar_valor(
+                        conta_corrente.valor_saldo_devedor_limite)) + " | "
+                string_para_copiar += "Quant. Dias Utilizando Limite: " + \
+                    str(conta_corrente.quantidade_dias_utilizado_limite) + " | "
+                string_para_copiar += "Quant. Dias Utilizando ADP: " + \
+                    str(conta_corrente.quantidade_dias_atraso_parcela_utilizado_adp) + " | "
+                string_para_copiar += "Valor do Saldo Devedor ADP: " + \
+                    str(formatar_valor(conta_corrente.valor_saldo_devedor_adp)) + "\n"
+                if conta_corrente.garantias_conta_corrente:
+                    string_para_copiar += "Garantia Conta Corrente: " + "\n"
+                    for garantia in conta_corrente.garantias_conta_corrente:
+                        string_para_copiar += (
+                            garantia.tipo_garantia if garantia else "--") + " | "
+                        string_para_copiar += (
+                            garantia.nome_garantidor if garantia else "--") + "\n"
+                else:
+                    string_para_copiar += "Conta Corrente sem garantia" + "\n"
+        else:
+            string_para_copiar += f"Não possui Conta Corrente\n"
+
+        if self.conta_corrente_pessoa.exists():
+            string_para_copiar += f"\nLançamentos da Conta Corrente - 6 meses\n"
+            total_quantidade, total_credito, tipo_lancamento, percentual_max = self.pessoa.total_movimentacoes()
+            string_para_copiar += f"Quant. total: " + str(total_quantidade) + " | " + f"Valor Total: " + str(formatar_valor(
+                total_credito)) + " | " + f"Maior movimentação: " + str(tipo_lancamento) + " - " + str(formatar_porcentagem(percentual_max)) + "\n"
+            string_para_copiar += f"\nLançamentos da Conta Corrente - 1 ano\n"
+            total_quantidade, total_valor_credito, total_valor_debito, tipo_lancamento, percentual_max, lancamentos_credito, lancamentos_debito = self.pessoa.total_movimentacoes_sem_filtro()
+            string_para_copiar += f"Quant. total: " + str(total_quantidade) + " | " + f"Valor Total Crédito: " + str(formatar_valor(total_valor_credito)) + " | " + f"Valor Total Débito: " + str(formatar_valor(total_valor_debito)) + " | " + f"Lançamentos Débito: " + str(
+                lancamentos_debito) + " | " + f"Lançamentos Crédito: " + str(lancamentos_credito) + " | " + f"Maior movimentação: " + str(tipo_lancamento) + " - " + str(formatar_porcentagem(percentual_max)) + "\n"
+        return string_para_copiar
+
+    def copiar_grupo_economico(self) -> str:
+        string_para_copiar = ""
+        if self.grupo_economico:
+            string_para_copiar += f"\nGrupo Econômico\n"
+            string_para_copiar += "Descrição: " + str(self.grupo_economico.first().dados_gerais.descricao_grupo_economico if self.grupo_economico else "--") + " | "
+            string_para_copiar += "Endividamento Cooperativa: " + \
+                str(formatar_valor(self.saldo_devedor_grupo)) + " | "
+            string_para_copiar += "Endividamento Bacen: " + \
+                str(formatar_valor(self.saldo_devedor_bacen_grupo)) + " | "
+            string_para_copiar += "Integralização Conta Capital: " + \
+                str(formatar_valor(self.valor_total_capital_grupo)) + " | "
+            string_para_copiar += "Patrimônio Grupo: " + \
+                str(formatar_valor(self.valor_total_bens_grupo)) + "\n"
+            for pessoa_grupo_economico in self.grupo_economico:
+                string_para_copiar += "CPF: " + \
+                    str(pessoa_grupo_economico.cpf_cnpj if pessoa_grupo_economico else "--") + " | "
+                string_para_copiar += "Nome: " + str(pessoa_grupo_economico.dados_gerais.nome_razao_social if pessoa_grupo_economico.dados_gerais else "--") + " | "
+                string_para_copiar += "Risco: " + str(pessoa_grupo_economico.crls.first(
+                ).nivel_risco if pessoa_grupo_economico.crls.first() else "--") + "\n"
+        return string_para_copiar
+    
+    def copiar_cheque(self) -> str:
+        string_para_copiar = ""
+        if self.cheques_agregados_dict:
+            string_para_copiar += f"\nCheques\n"
+            if '11' in self.cheques_agregados_dict:
+                motivo_11 = self.cheques_agregados_dict['11']
+                string_para_copiar += "Motivo 11: " + str(formatar_valor(motivo_11['total_valor'])) + " | Quantidade: " + str(motivo_11['total_cheques']) + "\n"
+            if '12' in self.cheques_agregados_dict:
+                motivo_12 = self.cheques_agregados_dict['12']
+                string_para_copiar += "Motivo 12: " + str(formatar_valor(motivo_12['total_valor'])) + " | Quantidade: " + str(motivo_12['total_cheques']) + "\n"
+            if '21' in self.cheques_agregados_dict:
+                motivo_21 = self.cheques_agregados_dict['21']
+                string_para_copiar += "Motivo 21: " + str(formatar_valor(motivo_21['total_valor'])) + " | Quantidade: " + str(motivo_21['total_cheques']) + "\n"
+        return string_para_copiar
+    
+    def copiar_operacao(self) -> str:
+        string_para_copiar = ""
+        if self.operacao_pessoa:
+            string_para_copiar += f"\nOperação de Crédito" + "\n"
+            string_para_copiar += "Quant.: " + str(self.pessoa.total_operacoes_com_td_cheque()) + " | Valor total: " + str(formatar_valor(self.pessoa.total_saldo_devedor)) + "\n"
+            modalidade, porcentagem = self.pessoa.max_modalidade_e_porcentagem() if self.pessoa else ("", 0)
+            string_para_copiar += "Percentual da Maior Modalidade: {:.2f}% - {}\n".format(porcentagem, format_max_modalidade(modalidade)).replace('.', ',')
+        
+        for modalidade, operacoes in self.operacoes_vigentes.items():
+            
+            # Modalidade de td, apenas agrega os valores
+            if modalidade in ["DESCONTO DE DUPLICATAS", "DESCONTO DE CHEQUES - PRÓPRIOS"]:
+                for op in operacoes:
+                    self.total_saldo_devedor_td += op.valor_saldo_devedor_limite if op.valor_saldo_devedor_limite else 0
+                    self.valor_total_das_operacoes += op.valor_operacao_limite if op.valor_operacao_limite else 0 
+                    self.valor_parcelas += op.valor_medio_parcelas if op.valor_medio_parcelas else 0
+                    self.quant_parcelas += 1
+                    if not self.garantia_td:
+                        self.garantia_td.extend(op.garantias)
+            
+            # Modalidade de prejuízo, apenas agrega os valores
+            elif modalidade == "PREJUIZO TITULOS DESCONTADOS":
+                for op in operacoes:
+                    self.total_saldo_devedor_td_prejuizo += op.valor_saldo_devedor_limite if op.valor_saldo_devedor_limite else 0
+                    self.valor_total_das_operacoes_prejuizo += op.valor_operacao_limite if op.valor_operacao_limite else 0
+                    self.valor_parcelas_prejuizo += op.valor_medio_parcelas if op.valor_medio_parcelas else 0
+                    self.quant_parcelas_prejuizo += 1
+                    if not self.garantia_td_prej:
+                        self.garantia_td_prej.extend(op.garantias)
+            
+            # Modalidade de cartão, exibe diretamente
+            elif modalidade == "CARTAO":
+                string_para_copiar += f"\nCartão\n"
+                for op in operacoes:
+                    string_para_copiar += "Limite Atribuído: " + (str(formatar_valor(op.valor_operacao_limite)) if op.valor_operacao_limite else "R$ 0,00") + " | "
+                    string_para_copiar += "Dívida Consolidada: " + (str(formatar_valor(op.valor_saldo_devedor_limite)) if op.valor_saldo_devedor_limite else "R$ 0,00") + " | "
+                    string_para_copiar += "Situação Conta Cartão: " + (str(op.situacao_conta_cartao) if op.situacao_conta_cartao else "--") + "\n"
+            
+            # Outras modalidades, exibe os detalhes
+            else:
+                # Cabeçalho para cada modalidade
+                self.total_valor_operacao = sum(op.valor_saldo_devedor_limite for op in operacoes if op.valor_saldo_devedor_limite)
+                self.quantidade_contratos = len(operacoes)
+                string_para_copiar += f"\n{modalidade} x {self.quantidade_contratos}\n"
+                string_para_copiar += f"Valor Total Saldo Devedor: {formatar_valor(self.total_valor_operacao)}\n\n"
+
+                # Detalhe das operações
+                for op in operacoes:
+                    string_para_copiar += "Linha de Crédito: " + (op.linha_credito if op.linha_credito else "--") + " | "
+                    string_para_copiar += "Valor da Operação: " + (str(formatar_valor(op.valor_operacao_limite)) if op.valor_operacao_limite else "R$ 0,00") + " | "
+                    string_para_copiar += "Quant. Parcelas: " + (str(op.quantidade_parcelas) if op.quantidade_parcelas else "0") + " | "
+                    string_para_copiar += "Quant. de Parcelas Pagas: " + (str(op.quantidade_parcelas_pagas) if op.quantidade_parcelas_pagas else "0") + "\n"
+                    
+                    # Garantias associadas à operação
+                    if op.garantias:
+                        string_para_copiar += "Garantia:\n"
+                        for garantia in op.garantias:
+                            string_para_copiar += "Tipo: " + (garantia.tipo_garantia if garantia else "--") + " | "
+                            string_para_copiar += "Garantia: " + (garantia.garantia if garantia else "--") + " | "
+                            string_para_copiar += "Garantidor: " + (garantia.nome_garantidor if garantia else "--") + " | "
+                            string_para_copiar += "Valor: " + str(formatar_valor(garantia.valor) if garantia else "--") + "\n"
+                    else:
+                        string_para_copiar += "Sem garantia\n"
+                        
+                    string_para_copiar += "\n"
+        
+        return string_para_copiar
+    
+    def copiar_extra_info(self) -> str:
+        string_para_copiar = ""
+        if self.total_saldo_devedor_td != 0:
+            string_para_copiar += f"\nOperação de Crédito - TD agregado\n"
+            string_para_copiar += "Modalidade: TITULOS DESCONTADOS" + " | "
+            string_para_copiar += "Valor do Saldo Devedor Total: " + (str(formatar_valor(self.total_saldo_devedor_td))) + "\n"
+            
+        if self.total_saldo_devedor_td_prejuizo != 0:
+            string_para_copiar += f"\nOperação de Crédito - Prejuízo TD agregado:\n"
+            string_para_copiar += "Modalidade: PREJUIZO TITULOS DESCONTADOS" + " | "
+            string_para_copiar += "Valor Total do Saldo Devedor: " + (str(formatar_valor(self.total_saldo_devedor_td_prejuizo))) + "\n"
+        
+        if self.limite:
+            string_para_copiar += f"\nLimite de Desconto\n"
+            string_para_copiar += "Valor Limite: " + str(formatar_valor(self.limite.limite)) + " | "
+            string_para_copiar += "Valor Utilizado: " + str(formatar_valor(self.limite.utilizado)) + "\n"
+
+        if self.bacen:
+            string_para_copiar += f"\nBacen - Total" + "\n"
+            string_para_copiar += "Valor Total Saldo Devedor: " + (str(formatar_valor(self.pessoa.total_saldo_devedor_bacen())) if self.pessoa else "R$ 0,00") + "\n"
+            string_para_copiar += "Endividamento Curto Prazo Total: " + (str(formatar_valor(self.pessoa.total_endividamento_curto_bacen())) if self.pessoa else "R$ 0,00") + "\n"
+            string_para_copiar += "Endividamento Longo Prazo Total: " + (str(formatar_valor(self.pessoa.total_endividamento_longo_bacen())) if self.pessoa else "R$ 0,00") + "\n"    
+            string_para_copiar += "Prejuízo Total: " + (str(formatar_valor(self.pessoa.total_prejuizo_bacen())) if self.pessoa else "R$ 0,00") + "\n"    
+            string_para_copiar += "Valor Vencido Total: " + (str(formatar_valor(self.pessoa.total_vencido_bacen())) if self.pessoa else "R$ 0,00") + "\n"    
+            string_para_copiar += "Percentual da Maior Modalidade: " + (str(formatar_porcentagem(self.pessoa.percentual_bacen())) + " - " + (self.pessoa.max_modalidade_bacen()) if self.pessoa else "R$ 0,00") + "\n" + "\n" 
+        
+        if self.renda_bacen:
+            string_para_copiar += f"Bacen dos últimos 3 anos:\n"
+            for i, rb in enumerate(self.renda_bacen):
+                string_para_copiar += "Data Movimento: " + str(rb.data_movimento.strftime('%d/%m/%Y') if rb else "--") + " - "
+                if i == len(self.renda_bacen) - 1:
+                    string_para_copiar += "Saldo Devedor: " + str(formatar_valor(rb.saldo_devedor_bacen) if rb else "--") + "\n"
+                else:
+                    string_para_copiar += "Saldo Devedor: " + str(formatar_valor(rb.saldo_devedor_bacen) if rb else "--") + " | "
+        
+        if self.serasa:
+            string_para_copiar += f"\nSerasa" + "\n"
+            string_para_copiar += "Score: " + str(self.serasa.score) + "\n"
+            if self.serasa.acao_judicial:
+                string_para_copiar += "Ação Judicial: " + str(self.serasa.acao_judicial) + "\n"
+            if self.serasa.divida_vencida:
+                string_para_copiar += "Dívida Vencida: " + str(self.serasa.divida_vencida) + "\n" 
+            if self.serasa.falencia:
+                string_para_copiar += "Falência: " + str(self.serasa.falencia) + "\n"
+            if self.serasa.pefin:
+                string_para_copiar += "PEFIN: " + str(self.serasa.pefin) + "\n" 
+            if self.serasa.protesto:
+                string_para_copiar += "Protesto: " + str(self.serasa.protesto) + "\n"
+            if self.serasa.refin:
+                string_para_copiar += "REFIN: " + str(self.serasa.refin) + "\n" 
+            if self.serasa.recheque:
+                string_para_copiar += "Recheque: " + str(self.serasa.recheque) + "\n"
+        else:
+            string_para_copiar += "\nNão possui registros do Serasa cadastrados" + "\n"
+        
+        if self.anotacoes_baixadas_por_mes:
+            string_para_copiar += "\nAnotações Baixadas:\n"
+            string_para_copiar += f"Total de Anotações: {sum(v['total_anotacoes'] for v in self.anotacoes_baixadas_por_mes)}" + " | "
+            string_para_copiar += f"Valor Total: " + formatar_valor(sum(v['total_valor'] for v in self.anotacoes_baixadas_por_mes)) + "\n" + "\n"
+        else:
+            string_para_copiar += "\nNão possui anotações Baixadas" + "\n"
+            
+        if self.anotacoes_vigentes_por_mes:
+            string_para_copiar += "\nAnotações Vigentes:\n"
+            string_para_copiar += f"Total de Anotações: {sum(v['total_anotacoes'] for v in self.anotacoes_vigentes_por_mes)}" + " | "
+            string_para_copiar += f"Valor Total: " + formatar_valor(sum(v['total_valor'] for v in self.anotacoes_vigentes_por_mes)) + "\n" + "\n"
+        else:
+            string_para_copiar += "\nNão possui anotações Vigentes" + "\n" + "\n" + "\n"
+        return string_para_copiar
+    
+    def copiar(self) -> str:
+        string_para_copiar = ""
+        string_para_copiar += self.copiar_sumula()
+        string_para_copiar += self.copiar_dados_pessoa()
+        string_para_copiar += self.copiar_conta_corrente()
+        string_para_copiar += self.copiar_grupo_economico()
+        string_para_copiar += self.copiar_cheque()
+        string_para_copiar += self.copiar_operacao()
+        string_para_copiar += self.copiar_extra_info()
+        
+        return string_para_copiar
